@@ -1,0 +1,4 @@
+This software depends on the following libraries:
+1.MPICH>3.3
+2.EIGEN 3.0 or above
+3.C++ BOOST>1.61

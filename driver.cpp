@@ -1,0 +1,188 @@
+#include<iostream>
+#include<iomanip>
+#include<fstream>
+#include<string>
+#include"ParallelBundleAdjustmentSolver.hpp"
+
+boost::mpi::environment env;
+boost::mpi::communicator world;
+
+//#define PARTIAL_READ
+
+#ifdef PARTIAL_READ
+int thresholding;
+#endif
+
+bool loadBundlerDataFromFile(std::ifstream& in, std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList,
+				unsigned int& numOfObjectPoint, unsigned int& numOfProjection, unsigned int& numOfCamera)
+{
+	if(!(in>>numOfCamera>>numOfObjectPoint>>numOfProjection))
+		return false; 
+
+	unsigned int localObjectPointNum = 0;
+	unsigned int localProjectionNum = 0;
+	unsigned int localCameraNum = 0;
+
+	//vCameraList.resize(localCameraNum);
+	//vProjectionList.resize(localProjectionNum);
+	//vObjectPointList.resize(localObjectPointNum );
+
+
+	if(world.rank() == 0)
+	{
+		std::cout<<"Reading objectpoint and observation data in a crossover way."<<std::endl;
+		std::cout<<"Complete camera data have to be read."<<std::endl;
+	}
+
+#ifdef PARTIAL_READ
+	std::vector<bool> including(numOfObjectPoint, false);
+	std::vector<int> indicating(numOfObjectPoint, -1);
+#endif
+
+	for(unsigned int i = 0; i < numOfProjection; i++)
+	{
+		int camidx, optidx;
+		double x, y;
+
+		if(!(in>>camidx>>optidx>>x>>y))
+			return false;
+#ifdef PARTIAL_READ
+		if(camidx >= thresholding)
+		{
+			continue;
+		}
+		including[optidx] = true;
+#endif
+
+		if(optidx%world.size() == world.rank())
+		{
+			Projection node;
+			node.setProjectionParameter(camidx, optidx, x, y);
+			vProjectionList.push_back(node);
+
+			localProjectionNum++;
+		}
+
+
+	}
+
+
+	for(unsigned int i = 0; i < numOfCamera; i++)
+	{
+		double p[9];
+		for(int j = 0; j < 9; j++) in>>p[j];
+#ifdef PARTIAL_READ
+		if(i >= thresholding)
+		{
+			continue;
+		}
+#endif
+		Camera node;		
+		node.setInvertedRT(p, p+3);
+		node.setFocalLength(p[6]);
+
+		node.setProjectionDistortion(p[7], p[8]);
+		vCameraList.push_back(node);
+
+		localCameraNum++;
+	}
+
+	for(unsigned int i = 0; i < numOfObjectPoint; i++)
+	{
+		double p0, p1, p2;
+		in>>p0>>p1>>p2;
+#ifdef PARTIAL_READ	
+		if(!including[i])
+		{
+			continue;
+		}
+#endif
+		if(i%world.size() == world.rank())
+		{
+			ObjectPoint node;
+			node.setPoint(p0, p1, p2);
+			vObjectPointList.push_back(node);
+#ifdef PARTIAL_READ
+			indicating[i] = localObjectPointNum;
+#endif
+			localObjectPointNum++;
+		}
+	}
+
+#ifdef PARTIAL_READ
+	//number object point indices again
+	 for(unsigned int i = 0; i < localProjectionNum; i++)
+	 {
+		 int temp = vProjectionList[i].getObjectPointIndex();
+		 temp = indicating[temp];
+		 vProjectionList[i].setObjectPointIndex(temp);
+	 }
+#endif
+
+#ifdef PARTIAL_READ
+	numOfObjectPoint = localObjectPointNum;
+	numOfProjection = localProjectionNum;
+	numOfCamera = localCameraNum;
+#endif
+
+	std::cout<<"[CPU#"<<world.rank()<<"]:"<<"Number of objectpoints: "<<localObjectPointNum<<std::endl;
+	std::cout<<"[CPU#"<<world.rank()<<"]:"<<"Number of projections: "<<localProjectionNum<<std::endl;
+	std::cout<<"[CPU#"<<world.rank()<<"]:"<<"Number of cameras: "<<localCameraNum<<std::endl;
+
+	return true;
+	
+}
+
+bool storeBundlerDataFromFile(std::ofstream& out, std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList)
+{
+
+}
+
+int main(int argc, char* argv[])
+{
+	boost::mpi::environment env(argc, argv);
+	boost::mpi::communicator world;
+
+	std::vector<Camera> vCameraList;
+	std::vector<ObjectPoint> vObjectPointList;
+	std::vector<Projection> vProjectionList;
+
+	unsigned int numOfObjectPoint;
+	unsigned int numOfCamera;
+	unsigned int numOfProjection;
+
+	std::ifstream in(argv[1]);
+	if(!in.is_open())
+	{
+		std::cout<<"Open file failed, check your input!"<<std::endl;
+		return -1;
+	}
+
+#ifdef PARTIAL_READ
+	thresholding = atoi(argv[2]);
+#endif
+
+	if(!loadBundlerDataFromFile(in, vObjectPointList, vProjectionList, vCameraList, numOfObjectPoint, numOfProjection, numOfCamera))
+	{
+		std::cout<<"Load bundler data from file failed!!!"<<std::endl;
+	}
+
+	ParallelBundleAdjustmentSolver solver(world.rank(), world.size());
+	solver.setDimensionParameters(numOfObjectPoint, numOfProjection, numOfCamera, vObjectPointList.size(), vProjectionList.size(), vCameraList.size());
+
+#ifndef PARTIAL_READ
+	if(argc > 2)
+	{
+		double threshold;
+		std::stringstream ss;
+		ss << argv[2];
+		ss >> threshold;
+		std::cout<<threshold<<std::endl;
+		solver.SetMSEThreshold(threshold);
+	}
+#endif
+
+	solver.parallelBundleAdjustment(vObjectPointList, vProjectionList, vCameraList);
+
+	return 0;
+}

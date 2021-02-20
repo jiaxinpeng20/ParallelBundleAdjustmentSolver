@@ -1,0 +1,1049 @@
+#include"ParallelBundleAdjustmentSolver.hpp"
+#include<fstream>
+ParallelBundleAdjustmentSolver::ParallelBundleAdjustmentSolver(int procRank, int procSize)
+{
+	this->procRank = procRank;
+	this->procSize = procSize;
+
+    this->maxIteration = 10;
+    this->mBlockSize = 7;
+
+#ifdef BUNDLER_MODE
+	this->structureDimen = 3;
+	this->cameraDimen = 7;  //including intrinsic and extrinsic parameters, k2 is omitted here
+#else
+	this->structureDimen = 3;
+	this->cameraIntrinsicDimen = 6;
+	this->cameraExtrinsicDimen = 6;
+#endif
+
+	this->bFocalNormalize = true;
+	this->bDepthNormalize = true;
+	this->bUseRadialDistortion = false;
+	this->_data_normalize_median = 0.5f;
+	this->_focal_scaling = 1.0f;
+	this->_depth_scaling = 1.0f;
+
+	this->localObjectPointSize = 0;
+	this->localObservationSize = 0;
+	this->localCameraSize = 0;
+
+	lm_previous_error = -1.0f;
+	lm_current_error = -1.0f;
+	lm_min_damping = 1.0e-10;
+	lm_max_damping = 1.0e+5;
+	lm_damping_ratio = 0.01f;
+	lm_damping_scaling = 2.0f;
+	lm_delta_threshold = 1.0e-6;
+	lm_mse_threshold = 0.0f;//breaking conditions for MSE
+
+	this->MSE = 0.0f;
+
+}
+
+ParallelBundleAdjustmentSolver::~ParallelBundleAdjustmentSolver()
+{
+
+}
+
+void ParallelBundleAdjustmentSolver::SetMSEThreshold(double threshold)
+{
+	lm_mse_threshold = threshold;
+}
+
+void ParallelBundleAdjustmentSolver::setDimensionParameters(unsigned int numOfObjectPoint, unsigned int numOfProjection, unsigned int numOfCamera, 
+				unsigned int localObjectPointSize, unsigned int localObservationSize, unsigned int localCameraSize)
+{
+
+	this->numOfObjectPoint = numOfObjectPoint;
+	this->numOfProjection = numOfProjection;
+	this->numOfCamera = numOfCamera;
+	this->localObjectPointSize = localObjectPointSize;
+	this->localObservationSize = localObservationSize;
+	this->localCameraSize = localCameraSize;
+	this->cameraMatrixSize = numOfCamera * cameraDimen;
+}
+
+void ParallelBundleAdjustmentSolver::normalizeFocal(std::vector<Camera> vCameraList)
+{
+	if(!bFocalNormalize)
+	{
+		return;
+	}
+
+	if(_focal_scaling == 1.0f)
+	{
+		std::vector<double> focal(numOfCamera);
+		for(int i = 0; i < numOfCamera; i++)
+		{
+			focal[i] = vCameraList[i].getFocalLength();	
+		}
+		std::nth_element(focal.begin(), focal.begin() + numOfCamera/2, focal.end());
+
+		double median_focal_length = focal[numOfCamera/2];
+		_focal_scaling = _data_normalize_median / median_focal_length;
+
+		for(int i = 0; i < numOfCamera; i++)
+		{
+			vCameraList[i].setFocalLength(vCameraList[i].getFocalLength() * _focal_scaling);
+		}
+	}
+
+}
+/*
+void ParallelBundleAdjustmentSolver::normalizeDepth(std::vector<ObjectPoint> vObjectPointList, std::vector<Projection> vProjectionList, std::vector<Camera> vCameraList)
+{
+	if(_depth_scaling == 1.0f)
+	{
+		const double     dist_bound = 1.0f;
+        	vector<double>   oz(numOfProjection);
+        	vector<double>   cpdist1(numOfCamera,  dist_bound);
+        	vector<double>   cpdist2(numOfCamera, -dist_bound); 
+        	vector<int>     camnpj(numOfCamera, 0), cambpj(numOfCamera, 0);
+        	int bad_point_count = 0; 
+
+		for(int i = 0; i < localObservationSize; i++)
+		{
+			int cam = vProjectionList[i].getCameraIndex();
+			int opt = vProjectionList[i].getObjectPointIndex();	
+			
+			Eigen::MatrixXd R = vCameraList[cam].getRotation();
+			Eigen::VectorXd T = vCameraList[cam].getTranslation();
+
+			oz[i] = vObjectPointList[opt].getPointX() * R(2, 0) +
+			        vObjectPointList[opt].getPointY() * R(2, 1) +
+				vObjectPointList[opt].getPointZ() * R(2, 2) + T(2);
+
+			double ozr = oz[i] / T(2);
+
+			if(fabs(ozr) < 0.01f)
+			{
+				bad_point_count++;
+				double px = vObjectPointList[opt].getPointX() * R(0, 0) + vObjectPointList[opt].getPointY() * R(0, 1) + vObjectPointList[opt].getPointZ() * R(0, 2) + T(0);
+				double py = vObjectPointList[opt].getPointX() * R(1, 0) + vObjectPointList[opt].getPointY() * R(1, 1) + vObjectPointList[opt].getPointZ() * R(1, 2) + T(1);
+				double mx = vProjectionList[i].getPointX(), my = vProjectionList[i].getPointY();
+
+				bool checkx = fabs(x) > fabs(y);
+                		if( ( checkx && px * oz[i] * mx < 0 && fabs(mx) > 64) || (!checkx && py * oz[i] * my < 0 && fabs(my) > 64)) 
+                		{
+
+                    			if(oz[i] > 0)     cpdist2[cam] = 0;
+                    			else              cpdist1[cam] = 0;
+                		}
+                		if(oz[i] >= 0) cpdist1[cam] = std::min(cpdist1[cam], oz[i]);
+                		else           cpdist2[cam] = std::max(cpdist2[cam], oz[i]); 
+            		}
+            		if(oz[i] < 0) { __num_point_behind++;   cambpj[cmidx]++;}
+            		camnpj[cmidx]++;
+        	}
+
+        	if(bad_point_count > 0 && _depth_degeneracy_fix)
+        	{
+            		_focal_normalize = true;
+            		_depth_normalize = true;
+        	}
+
+        	if( _depth_normalize )
+        	{
+            		std::nth_element(oz.begin(), oz.begin() + _num_imgpt / 2, oz.end());
+            		double oz_median = oz[_num_imgpt / 2];
+            		double shift_min = std::min(oz_median * 0.001f, 1.0f);
+            		double dist_threshold = shift_min * 0.1f;
+            		_depth_scaling =  (1.0 / oz_median) / __data_normalize_median;
+           
+            		for(int i = 0; i < _num_camera; ++i)
+            		{
+                		//move the camera a little bit?
+                		if(!__depth_degeneracy_fix)
+                		{
+
+                		}else if((cpdist1[i] < dist_threshold || cpdist2[i] > -dist_threshold) )
+                		{
+                    			float shift_epsilon = fabs(_camera_data[i].t[2] * FLT_EPSILON);
+                    			float shift = std::max(shift_min, shift_epsilon); 
+                    			bool  boths = cpdist1[i] < dist_threshold && cpdist2[i] > -dist_threshold;
+                    			_camera_data[i].t[2] += shift;  
+                    
+                    			__num_camera_modified++;
+                		}
+                		_camera_data[i].t[0] *= __depth_scaling;
+                		_camera_data[i].t[1] *= __depth_scaling;
+                		_camera_data[i].t[2] *= __depth_scaling;
+            		}
+            		for(int i = 0; i < _num_point; ++i)
+            		{
+               			/////////////////////////////////
+                		_point_data[4 *i + 0] *= __depth_scaling;
+                		_point_data[4 *i + 1] *= __depth_scaling;
+                		_point_data[4 *i + 2] *= __depth_scaling;
+            		}
+        	}
+        	if(__num_point_behind > 0)    std::cout << "WARNING: " << __num_point_behind << " points are behind camras.\n";
+        	if(__num_camera_modified > 0) std::cout << "WARNING: " << __num_camera_modified << " camera moved to avoid degeneracy.\n";
+
+
+	}
+}
+*/
+bool ParallelBundleAdjustmentSolver::fillSparseMatrix(std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList)
+{
+	osvColIdx.resize(localObservationSize);
+	osvRowIdx.resize(localObjectPointSize + 1);
+	osvRowIdx(localObjectPointSize) = localObjectPointSize;
+
+	structureMatrix.resize(localObjectPointSize);
+	cameraMatrix.resize(localCameraSize);
+	observationMatrix.resize(localObservationSize);
+	double error = 0.0f;
+
+	//initializing
+	int former = -1;
+	objectPointVector = Eigen::VectorXd::Zero(localObjectPointSize*structureDimen);
+	cameraVector = Eigen::VectorXd::Zero(localCameraSize*cameraDimen);
+	for(int i = 0; i < localObjectPointSize; i++)
+	{
+		structureMatrix[i] = Eigen::MatrixXd::Zero(structureDimen, structureDimen);
+	}
+	for(int i = 0; i < localCameraSize; i++)
+	{
+		cameraMatrix[i] = Eigen::MatrixXd::Zero(cameraDimen, cameraDimen);
+	}
+	for(int k = 0;  k < vProjectionList.size(); k++)
+	{	
+		//Reprojection
+		int optIndex = vProjectionList[k].getObjectPointIndex();
+		int camIndex = vProjectionList[k].getCameraIndex();
+
+		Eigen::VectorXd optCoord(3);
+		Eigen::VectorXd camCoord(3);
+		Eigen::VectorXd pixelCoord(3);
+		Eigen::MatrixXd R = vCameraList[camIndex].getRotation();
+
+		vObjectPointList[optIndex/world.size()].getPoint(optCoord(0), optCoord(1), optCoord(2));
+		camCoord = R * optCoord;
+		pixelCoord =  camCoord + vCameraList[camIndex].getTranslation();
+
+		
+		double p[2];
+		p[0] = pixelCoord(0) / pixelCoord(2);//Perspective projection in x 
+		p[1] = pixelCoord(1) / pixelCoord(2);//Perspective projection in y
+
+		//Compute Jacobian Matrix
+		double jacobianOfStructure[2][3];
+		double jacobianOfCamera[2][9];
+		double f = vCameraList[camIndex].getFocalLength();
+		double k1 = vCameraList[camIndex].getDistortionk1();
+		double k2 = vCameraList[camIndex].getDistortionk2();
+
+		//Estimate errors
+		double q[2],e[2];
+		q[0] = vProjectionList[k].getPointX();
+		q[1] = vProjectionList[k].getPointY();
+		e[0] = q[0] - f*p[0];
+		e[1] = q[1] - f*p[1];
+		error +=e[0]*e[0] + e[1]*e[1];
+
+		if(bUseRadialDistortion)
+		{
+			double r1 = 1.0 + k1*(p[0]*p[0]+p[1]*p[1]);
+			double r2 = 1.0 + k1*(p[0]*p[0]+p[1]*p[1]) + k2*(p[0]*p[0] + p[1]*p[1])*(p[0]*p[0] + p[1]*p[1]);
+			double r_k1 = (p[0]*p[0]+p[1]*p[1]);
+			double r_k2 = (p[0]*p[0] + p[1]*p[1])*(p[0]*p[0] + p[1]*p[1]);
+			double r_k1_x = p[0]*p[0];
+			double r_k1_y = p[1]*p[1];
+			double dr_dx = (1.0 + 3.0*k1*r_k1_x + k1*r_k1_y + k2*r_k2 + 4.0*k2*r_k1_x*r_k1);
+			double dr_dy = (1.0 + k1*r_k1_x + 3.0*k1*r_k1_y + k2*r_k2 + 4.0*k2*r_k1_y*r_k1);
+
+
+
+
+			//Jacobian matrix of camera intrinsic and extrinsic parameters
+			jacobianOfCamera[0][0] = r2*p[0]; //dx/df
+			jacobianOfCamera[0][1] = f/pixelCoord(2) * dr_dx; //dx/dt0
+			jacobianOfCamera[0][2] = 0; //dx/dt1		
+			jacobianOfCamera[0][3] = -f/pixelCoord(2) * dr_dx * p[0]; //dx/dt2
+			jacobianOfCamera[0][4] = -f/pixelCoord(2) * dr_dx * p[0] * camCoord(1);
+			jacobianOfCamera[0][5] =  f/pixelCoord(2) * dr_dx * (camCoord(2) + camCoord(0)*p[0]);
+			jacobianOfCamera[0][6] = -f/pixelCoord(2) * dr_dx * camCoord(1);
+			jacobianOfCamera[0][7] = f*r_k1*p[0]; //dx/dk1
+			jacobianOfCamera[0][8] = f*r_k2*p[0]; //dx/dk2	
+
+
+			jacobianOfCamera[1][0] = r2*p[1]; //dy/df
+			jacobianOfCamera[1][1] = 0; //dy/dt0
+			jacobianOfCamera[1][2] = f/pixelCoord(2) * dr_dy; //dy/dt1		
+			jacobianOfCamera[1][3] = -f/pixelCoord(2) * dr_dy * p[1]; //dy/dt2
+			jacobianOfCamera[1][4] = -f/pixelCoord(2) * dr_dy * (camCoord(2) + camCoord(1)*p[1]);
+			jacobianOfCamera[1][5] = f/pixelCoord(2) * dr_dy * p[1] * camCoord(0);
+			jacobianOfCamera[1][6] = f/pixelCoord(2) * dr_dy * camCoord(0);
+			jacobianOfCamera[1][7] = f*r_k1*p[1]; //dy/dk1
+			jacobianOfCamera[1][8] = f*r_k2*p[1]; //dy/dk2	
+	
+			//Jacobian matrix of structure parameters
+			jacobianOfStructure[0][0] = f/pixelCoord(2) * dr_dx *(R(0, 0) - R(0, 2)*p[0]);
+			jacobianOfStructure[0][1] = f/pixelCoord(2) * dr_dx *(R(1, 0) - R(1, 2)*p[0]);
+			jacobianOfStructure[0][2] = f/pixelCoord(2) * dr_dx *(R(2, 0) - R(2, 2)*p[0]);
+			jacobianOfStructure[1][0] = f/pixelCoord(2) * dr_dy *(R(0 ,1) - R(0, 2)*p[1]);
+			jacobianOfStructure[1][1] = f/pixelCoord(2) * dr_dy *(R(1, 1) - R(1, 2)*p[1]);
+			jacobianOfStructure[1][2] = f/pixelCoord(2) * dr_dy *(R(2, 1) - R(2, 2)*p[1]);
+		}
+		else
+		{
+			double x0 = camCoord(0);
+			double y0 = camCoord(1);
+			double z0 = camCoord(2);
+			double p2 = pixelCoord(2);
+			double f_p2 = f/p2;
+			double p0_p2 = p[0];
+			double p1_p2 = p[1];
+
+			//Jacobian matrix of camera intrinsic and extrinsic parameters
+			jacobianOfCamera[0][0] = p0_p2; //dx/df
+			jacobianOfCamera[0][1] = f_p2;
+			jacobianOfCamera[0][2] = 0;
+			jacobianOfCamera[0][3] = -f_p2 * p0_p2;
+			jacobianOfCamera[0][4] = -f_p2 * p0_p2 * y0;
+			jacobianOfCamera[0][5] = f_p2 * (z0 + x0 * p0_p2);
+			jacobianOfCamera[0][6] = -f_p2 * y0;
+			jacobianOfCamera[0][7] = 0;
+			jacobianOfCamera[0][8] = 0;
+
+
+			jacobianOfCamera[1][0] = p1_p2; //dy/df
+			jacobianOfCamera[1][1] = 0;
+			jacobianOfCamera[1][2] = f_p2;
+			jacobianOfCamera[1][3] = -f_p2 * p1_p2;
+			jacobianOfCamera[1][4] = -f_p2 * (z0 + y0 * p1_p2);
+			jacobianOfCamera[1][5] = f_p2 * x0 * p1_p2;
+			jacobianOfCamera[1][6] = f_p2 * x0;  
+			jacobianOfCamera[1][7] = 0;
+			jacobianOfCamera[1][8] = 0;
+
+
+			//Jacobian matrix of structure parameters
+			jacobianOfStructure[0][0] = f_p2 * (R(0, 0) - R(2, 0)*p0_p2);
+			jacobianOfStructure[0][1] = f_p2 * (R(0, 1) - R(2, 1)*p0_p2);
+			jacobianOfStructure[0][2] = f_p2 * (R(0, 2) - R(2, 2)*p0_p2);
+
+			jacobianOfStructure[1][0] = f_p2 * (R(1, 0) - R(2, 0)*p1_p2);
+			jacobianOfStructure[1][1] = f_p2 * (R(1, 1) - R(2, 1)*p1_p2);
+			jacobianOfStructure[1][2] = f_p2 * (R(1, 2) - R(2, 2)*p1_p2);
+		}
+
+		//fill Hessian matrices
+		int optColumn = optIndex/world.size() * structureDimen;
+		int camColumn = camIndex * cameraDimen;
+
+		for(int i = 0; i < structureDimen; i++)//object point data 
+		{
+			for(int j = i; j < structureDimen; j++)
+			{
+				double val = jacobianOfStructure[0][i] * jacobianOfStructure[0][j] + jacobianOfStructure[1][i] * jacobianOfStructure[1][j]; //tensor product
+				structureMatrix[optIndex/world.size()](i, j) += val;
+				
+			}
+
+			objectPointVector(optColumn+i) +=  (jacobianOfStructure[0][i] * e[0] + jacobianOfStructure[1][i] * e[1]);
+
+		}
+
+
+		Eigen::MatrixXd subObservationMat(structureDimen, cameraDimen);
+		for(int i = 0; i < structureDimen; i++)//observation data
+		{
+			for(int j = 0; j < cameraDimen; j++)
+			{
+				double val = jacobianOfStructure[0][i] * jacobianOfCamera[0][j] + jacobianOfStructure[1][i] * jacobianOfCamera[1][j]; //tensor product
+				subObservationMat(i,j) = val;
+			}
+		}
+		observationMatrix[k] = subObservationMat;//uncorrect for multi-processors
+		osvColIdx(k) = camIndex;
+		if(optIndex/world.size() != former) //going to the next ROW
+		{
+			former = optIndex/world.size();
+			osvRowIdx(former) = k; //statistic nonzero matrices
+		}
+		//std::cout<<k<<std::endl<<observationMatrix[k]<<std::endl;
+
+
+		for(int i = 0; i < cameraDimen; i++)
+		{
+			for(int j = i; j < cameraDimen; j++)
+			{
+				double val = jacobianOfCamera[0][i]*jacobianOfCamera[0][j] + jacobianOfCamera[1][i]*jacobianOfCamera[1][j]; //tensor product
+				cameraMatrix[camIndex](i,j) += val;
+			}
+
+			cameraVector(camColumn+i) += (jacobianOfCamera[0][i]*e[0] + jacobianOfCamera[1][i]*e[1]);
+		}
+	}
+	osvRowIdx(localObjectPointSize) = vProjectionList.size();
+
+	//gather MSE from all processes
+	std::vector<double> errorByProcessor;
+	boost::mpi::all_reduce(world, &error, 1, &MSE, std::plus<double>());
+	lm_previous_error = lm_current_error;
+	lm_current_error = MSE;
+	MSE = MSE / (numOfProjection);
+	std::cout<<"Mean Square Error:  "<<MSE<<std::endl;
+
+	return true;
+}
+
+void ParallelBundleAdjustmentSolver::GetAugmentedHessian()
+{
+	//get Hessian augumented matrices
+	for(unsigned int i = 0; i < localObjectPointSize; i++)
+	{	
+		for(unsigned int j = 0; j < structureDimen; j++)
+		{
+			structureMatrix[i](j,j) += lm_damping_ratio * structureMatrix[i](j,j);
+		}
+		//std::cout<<i<<std::endl<<structureMatrix[i]<<std::endl;
+	}
+
+	for(unsigned int i = 0; i < localCameraSize; i++)
+	{
+		for(unsigned int j = 0; j < cameraDimen; j++)
+		{
+			cameraMatrix[i](j,j) += lm_damping_ratio * cameraMatrix[i](j,j);
+		}
+		//std::cout<<i<<std::endl<<cameraMatrix[i]<<std::endl;
+	}
+}
+
+
+void ParallelBundleAdjustmentSolver::parallelSchurComplement(Eigen::MatrixXd& RCM, Eigen::VectorXd& RCV)
+{
+	Eigen::MatrixXd MT = Eigen::MatrixXd::Zero(cameraMatrixSize, cameraMatrixSize);
+	Eigen::VectorXd VT = Eigen::VectorXd::Zero(cameraMatrixSize);
+
+	for(int i = 0; i < localObjectPointSize; i++)
+	{
+		Eigen::MatrixXd temp = structureMatrix[i];
+		structureMatrix[i] = Eigen::MatrixXd(temp.selfadjointView<Eigen::Upper>()).inverse();
+
+	}
+
+	for(int i = 0; i < localObjectPointSize; i++)//WT  x  H.inverse() x W
+	{
+		for(int j = osvRowIdx(i); j < osvRowIdx(i+1); j++)
+		{
+			Eigen::MatrixXd S = observationMatrix[j].transpose() * structureMatrix[i];
+
+			int row = osvColIdx(j);
+			for(int k = j; k < osvRowIdx(i+1); k++)
+			{
+				int col = osvColIdx(k);
+				MT.block(row*cameraDimen, col*cameraDimen, cameraDimen, cameraDimen) += S * observationMatrix[k];
+			}
+
+			VT.segment(row*cameraDimen, cameraDimen) += S * objectPointVector.segment(i*structureDimen, structureDimen);
+		}
+	}
+
+	//std::ofstream out("../MT.cms");
+	//out<<MT<<std::endl;
+	//out.close();
+	//std::cout<<MT.leftCols(13)<<std::endl;
+	int transferSize = 0x1fffffff;
+	int line = transferSize / cameraMatrixSize;
+	if(line > cameraMatrixSize)
+	{
+		line = cameraMatrixSize;
+	}
+
+	//gathering MT matrix
+	MT = -MT;
+	for(int i = 0; i < localCameraSize; i++)
+	{
+		MT.block(i*cameraDimen, i*cameraDimen, cameraDimen, cameraDimen) += cameraMatrix[i];
+	}
+	Eigen::MatrixXd sumMatrix(cameraMatrixSize, cameraMatrixSize);
+	for(int i = 0; i <= cameraMatrixSize/line; i++)//this is triangular, deal with it in a step way
+	{
+		if(i < cameraMatrixSize/line)
+		{
+			Eigen::MatrixXd MTReduce(cameraMatrixSize, line);
+			Eigen::MatrixXd schur = MT.middleCols(i*line, line);
+			boost::mpi::all_reduce(world, schur.data(), int(cameraMatrixSize*line), MTReduce.data(), std::plus<double>());
+			sumMatrix.middleCols(i*line, line) = MTReduce.sparseView();
+		}
+		else 
+		{
+			Eigen::MatrixXd MTReduce(cameraMatrixSize, cameraMatrixSize%line);
+			Eigen::MatrixXd schur = MT.middleCols(i*line, cameraMatrixSize%line);
+			boost::mpi::all_reduce(world, schur.data(), int(cameraMatrixSize*(cameraMatrixSize%line)), MTReduce.data(), std::plus<double>());
+			sumMatrix.middleCols(i*line, cameraMatrixSize%line) = MTReduce.sparseView();
+		}
+	}
+
+
+	//After schur complement
+	/*double sparsity0 = double((localObjectPointSize*structureDimen*structureDimen + localObservationSize*structureDimen*cameraDimen + localCameraSize*cameraDimen*cameraDimen)) / (localObjectPointSize*structureDimen + localCameraSize*cameraDimen) / (localObjectPointSize*structureDimen + localCameraSize*cameraDimen);
+	double sparsity1 = double(Eigen::SparseMatrix<double>(Eigen::MatrixXd(sumMatrix.selfadjointView<Eigen::Upper>()).sparseView()).nonZeros()) / (cameraMatrixSize*cameraMatrixSize);
+	std::ofstream out;
+	out.open("../sparsity.dat", std::ios::app);
+	out<<sparsity0<<"   "<<sparsity1<<"   "<<localCameraSize<<std::endl;
+	out.close();*/
+
+	//std::cout<<cameraMatrixSize<<"   "<<localObjectPointSize*structureDimen + localCameraSize*cameraDimen<<std::endl;
+	//gathering VT vector
+	sumMatrix = sumMatrix.triangularView<Eigen::Upper>();
+	Eigen::VectorXd VTReduce(cameraMatrixSize);
+	VT = cameraVector - VT;
+	boost::mpi::all_reduce(world, VT.data(), cameraMatrixSize, VTReduce.data(), std::plus<double>());
+
+
+#if 0
+
+	//Preconditioned Conjugate Gradient Silumations
+	Eigen::MatrixXd M = Eigen::MatrixXd::Zero(cameraMatrixSize, cameraMatrixSize);
+	for(int i = 0; i < localCameraSize; i++)
+	{
+		Eigen::MatrixXd temp = sumMatrix.block(i*cameraDimen, i*cameraDimen, cameraDimen, cameraDimen);
+		temp = temp.selfadjointView<Eigen::Upper>();
+		M.block(i*cameraDimen, i*cameraDimen, cameraDimen,cameraDimen) = temp.inverse();
+		
+	}
+	//std::cout<<M.inverse().leftCols(13)<<std::endl;
+
+
+	Eigen::VectorXd r0 = VTReduce;
+	Eigen::VectorXd z0 = M * r0;
+	Eigen::VectorXd p0 = z0;
+	Eigen::VectorXd x0 = Eigen::VectorXd::Zero(cameraMatrixSize);
+	Eigen::VectorXd ap = sumMatrix.selfadjointView<Eigen::Upper>()*z0;
+	Eigen::VectorXd vp = MT.selfadjointView<Eigen::Upper>()*p0;
+
+	//std::cout<<vp<<std::endl;
+for(int i = 0 ; i < 10; i++)
+{
+	double rtzk = z0.transpose()*r0;
+
+	//Eigen::SparseMatrix<double> H = mMatrixInv.selfadjointView<Eigen::Upper>();
+	/*for(int i = 0; i < localObjectPointSize; i++)
+	{
+		std::cout<<H.block(i*3, i*3, 3, 3)<<std::endl;
+	}*/
+	//Eigen::VectorXd wp = observationMatrix*p0;
+	//Eigen::VectorXd hwp = H * wp;
+	//Eigen::VectorXd whwp = observationMatrix.transpose()*H*wp;
+	Eigen::VectorXd apk = sumMatrix.selfadjointView<Eigen::Upper>()*p0;
+	double alpha = p0.transpose() * apk;
+	x0 = x0 + rtzk/alpha * p0;
+	r0 = r0 - rtzk/alpha * apk;
+
+	double norm = r0.norm();
+	//std::cout<<norm<<std::endl;
+
+	z0 = M * r0;
+	double beta = z0.transpose() * r0;
+	p0 = z0 + beta/rtzk * p0;
+	std::cout<<beta/rtzk<<std::endl;
+
+
+}
+	//Eigen::VectorXd r0 = VTReduce;
+	//Eigen::VectorXd z0 = Eigen::MatrixXd(M.inverse())*r0;
+
+#endif	
+
+
+
+
+
+
+
+
+
+
+
+
+	
+	//sampling reduce camera matrix into all processes
+	for(int i = world.rank(); i <= cameraMatrixSize/mBlockSize; i+=world.size())
+	{
+		if(i < cameraMatrixSize/mBlockSize)
+		{
+			RCM.middleCols(i*mBlockSize, mBlockSize) = sumMatrix.middleCols(i*mBlockSize, mBlockSize);
+		}
+		else
+		{
+			RCM.middleCols(i*mBlockSize, cameraMatrixSize%mBlockSize) = sumMatrix.middleCols(i*mBlockSize, cameraMatrixSize%mBlockSize);
+		}
+	} 
+
+	for(int i = world.rank(); i <= cameraMatrixSize/mBlockSize; i+=world.size())
+	{
+		if(i < cameraMatrixSize/mBlockSize)
+		{
+			RCV.segment(i*mBlockSize, mBlockSize) = VTReduce.segment(i*mBlockSize, mBlockSize);
+		}
+		else
+		{
+			RCV.segment(i*mBlockSize, cameraMatrixSize%mBlockSize) = VTReduce.segment(i*mBlockSize, cameraMatrixSize%mBlockSize);
+		}
+	}
+}
+
+void ParallelBundleAdjustmentSolver::parallelCholeskyDecomposition(Eigen::MatrixXd& RCM, Eigen::VectorXd& RCV)
+{
+
+	double a = 0.0f, b = 0.0f;
+	int margin = (cameraMatrixSize%mBlockSize==0 ? mBlockSize : cameraMatrixSize%mBlockSize);
+
+	for(int i = 0; i <= (cameraMatrixSize-margin)/mBlockSize; )
+	{
+		boost::mpi::timer ta;
+		int mDiagSize = ( i == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+		Eigen::MatrixXd mMatrixDiag(mDiagSize, mDiagSize);
+
+		if(i%world.size() == world.rank())
+		{
+			mMatrixDiag = Eigen::MatrixXd(RCM.block(i*mBlockSize, i*mBlockSize, mDiagSize, mDiagSize)).selfadjointView<Eigen::Upper>();
+			//std::cout<<mMatrixDiag<<std::endl;
+			//std::cout<<"**************************"<<std::endl;
+			//std::cout<<Eigen::MatrixXd(mMatrixDiag.llt().matrixU())<<std::endl<<std::endl;
+			if((i==(cameraMatrixSize-margin)/mBlockSize)&&(false))
+				std::cout<<mMatrixDiag<<std::endl<<std::endl;
+			mMatrixDiag = mMatrixDiag.llt().matrixU();
+			if((i==(cameraMatrixSize-margin)/mBlockSize)&&(false))
+				std::cout<<mMatrixDiag<<std::endl;
+			RCM.block(i*mBlockSize, i*mBlockSize, mDiagSize, mDiagSize) = mMatrixDiag.triangularView<Eigen::Upper>();
+
+		}
+			
+		if(i==(cameraMatrixSize-margin)/mBlockSize)//There is a barrier() at last, and all processes must be ended at the same time
+		{
+			break;
+		}
+		boost::mpi::broadcast(world, mMatrixDiag.data(), mDiagSize*mDiagSize, i%world.size());
+		double t5 = ta.elapsed();a+=t5;
+		
+	
+		ta.restart();
+		//compute the other submatrices for one row
+		int start = 0;
+		if(i%world.size() == world.rank())
+		{
+			start = i + world.size();
+		}
+		else if(i%world.size() < world.rank())
+		{
+			start = (i/world.size())*world.size() + world.rank();
+		}
+		else
+		{
+			start = (i/world.size())*world.size() + world.rank() + world.size();
+		}
+
+		for(int j = start; j <= (cameraMatrixSize-margin)/mBlockSize; j+=world.size())//for columns
+		{
+			int mHorSize = (  j  == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+	
+			RCM.block(i*mBlockSize, j*mBlockSize, mBlockSize, mHorSize) = Eigen::MatrixXd(Eigen::MatrixXd(mMatrixDiag.transpose()).inverse()) * RCM.block(i*mBlockSize, j*mBlockSize, mBlockSize, mHorSize);
+		}
+
+		//update the rest rows
+		int mVerSize = ( i+1 == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+		Eigen::MatrixXd pasadena((i+1)*mBlockSize, mVerSize);//special case in diagonal
+		if((i+1)%world.size() == world.rank())
+		{
+			pasadena = RCM.block(0, (i+1)*mBlockSize, (i+1)*mBlockSize, mVerSize);
+		}	
+		boost::mpi::broadcast(world, pasadena.data(), (i+1)*mBlockSize*mVerSize, (i+1)%world.size());
+			
+		for(int j = start; j <= (cameraMatrixSize-margin)/mBlockSize; j+=world.size())//for columns
+		{
+			int mHorSize = (  j  == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+
+			if(i+1!=j)
+			{
+				RCM.block((i+1)*mBlockSize, j*mBlockSize, mBlockSize, mHorSize) -= Eigen::MatrixXd(pasadena.transpose()) * RCM.block(0, j*mBlockSize, (i+1)*mBlockSize, mHorSize);
+			}
+			else//it is triangular in diagonal
+			{
+				Eigen::MatrixXd tempMat(mVerSize, mVerSize);
+				tempMat = RCM.block(j*mBlockSize, j*mBlockSize, mVerSize, mVerSize) - Eigen::MatrixXd(Eigen::MatrixXd(Eigen::MatrixXd(pasadena.transpose()) * pasadena).triangularView<Eigen::Upper>());
+				RCM.block(j*mBlockSize, j*mBlockSize, mVerSize, mVerSize) = tempMat;
+			}
+		}
+
+		double t6 = ta.elapsed();b+=t6;
+		//std::cout<<t5<<"  "<<t6<<std::endl;
+
+		world.barrier();
+		i++;
+		world.barrier();
+	}
+}
+
+void ParallelBundleAdjustmentSolver::parallelForwardBackwardSubstitution(Eigen::MatrixXd& RCM, Eigen::VectorXd& RCV)
+{
+	RCM.transposeInPlace();//Compute LTx = v
+	Eigen::VectorXd Xc = Eigen::VectorXd::Zero(cameraMatrixSize);
+
+	int margin = (cameraMatrixSize%mBlockSize==0 ? mBlockSize : cameraMatrixSize%mBlockSize);
+	for(int i = 0; i<= (cameraMatrixSize-margin)/mBlockSize; )//forward substitution
+	{
+		int mDiagSize = ( i == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+		Eigen::VectorXd mVectorDiag(mDiagSize);
+
+		if(i%world.size() == world.rank())
+		{
+			Eigen::MatrixXd mMatrixDiag = RCM.block(i*mBlockSize, i*mBlockSize, mDiagSize, mDiagSize);
+			mVectorDiag	= mMatrixDiag.triangularView<Eigen::Lower>().solve(RCV.segment(i*mBlockSize, mDiagSize));
+			Xc.segment(i*mBlockSize, mDiagSize) = mVectorDiag;
+		}
+
+		if(i==(cameraMatrixSize-margin)/mBlockSize)
+		{
+			break;
+		}
+		boost::mpi::broadcast(world, mVectorDiag.data(), mDiagSize, i%world.size());
+
+		//update the rest rows. There is no need to refresh RCM, and we can just update Ub instead
+		int start = (i%world.size()<world.rank() ? i/world.size()*world.size()+world.rank() : i/world.size()*world.size()+world.rank()+world.size());
+
+		for(int j = start; j <= (cameraMatrixSize-margin)/mBlockSize; j+=world.size())//for rows
+		{
+			int mRowSize = ( j == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+			RCV.segment(j*mBlockSize, mRowSize) -= RCM.block(j*mBlockSize, i*mBlockSize, mRowSize, mBlockSize) * mVectorDiag;
+		}
+		world.barrier();
+		i++;
+		world.barrier();
+	}
+
+
+	RCM.transposeInPlace();//Compute Lx = v
+	Eigen::MatrixXd matUpper(cameraMatrixSize, cameraMatrixSize);
+	boost::mpi::all_reduce(world, RCM.data(), (int)cameraMatrixSize*cameraMatrixSize, matUpper.data(), std::plus<double>());// RCM -> matUpper
+
+	for(int i = (cameraMatrixSize-margin)/mBlockSize; i >= 0; )//backward substitution
+	{
+		int mDiagSize = ( i == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+
+		Eigen::VectorXd mVectorDiag(mDiagSize);
+		if(i%world.size() == world.rank())
+		{
+			Eigen::MatrixXd mMatrixDiag = matUpper.block(i*mBlockSize, i*mBlockSize, mDiagSize, mDiagSize);
+			mVectorDiag	= mMatrixDiag.triangularView<Eigen::Upper>().solve(Xc.segment(i*mBlockSize, mDiagSize));
+			//std::cout<<i<<"    "<<mVectorDiag.transpose()<<std::endl;
+			Xc.middleRows(i*mBlockSize, mDiagSize) = mVectorDiag;
+		}
+
+		if(i==0)
+		{
+			break;
+		}
+		boost::mpi::broadcast(world, mVectorDiag.data(), mDiagSize, i%world.size());
+
+		//update the rest rows. There is no need to refresh RCM, and we can just update Ub instead
+		for(int j = world.rank(); j < i; j+=world.size())//for rows
+		{
+			int mRowSize = ( j == (cameraMatrixSize-margin)/mBlockSize ? margin : mBlockSize);
+			Xc.middleRows(j*mBlockSize, mRowSize) -= matUpper.block(j*mBlockSize, i*mBlockSize, mRowSize, mDiagSize) * mVectorDiag;
+		}
+
+		world.barrier();
+		i--;
+		world.barrier();
+
+	}
+
+	cameraVectorX.resize(cameraMatrixSize);
+	boost::mpi::all_reduce(world, Xc.data(), (int)cameraMatrixSize, cameraVectorX.data(), std::plus<double>()); 
+//std::cout<<cameraVectorX<<std::endl;
+}
+
+void UncompressRodriguesRotation(const double d[3], Eigen::MatrixXd& DR)
+{
+        double a = sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+        double ct = a==0.0?0.5f:(1.0f-cos(a))/a/a;
+        double st = a==0.0?1:sin(a)/a;
+        DR(0,0)=double(1.0 - (d[1]*d[1] + d[2]*d[2])*ct);
+        DR(0,1)=double(d[0]*d[1]*ct - d[2]*st);
+        DR(0,2)=double(d[2]*d[0]*ct + d[1]*st);
+        DR(1,0)=double(d[0]*d[1]*ct + d[2]*st);
+        DR(1,1)=double(1.0f - (d[2]*d[2] + d[0]*d[0])*ct);
+        DR(1,2)=double(d[1]*d[2]*ct - d[0]*st);
+        DR(2,0)=double(d[2]*d[0]*ct - d[1]*st);
+        DR(2,1)=double(d[1]*d[2]*ct + d[0]*st);
+        DR(2,2)=double(1.0 - (d[0]*d[0] + d[1]*d[1])*ct );
+}
+
+void ParallelBundleAdjustmentSolver::updateParameters(std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList)
+{
+	for(int i = 0; i < localObjectPointSize; i++)
+	{
+		double x, y, z;
+		vObjectPointList[i].getPoint(x, y, z);
+		x = x + objectPointVectorX(i*structureDimen + 0);
+		y = y + objectPointVectorX(i*structureDimen + 1);
+		z = z + objectPointVectorX(i*structureDimen + 2);
+
+		vObjectPointList[i].setPoint(x, y, z);
+	}
+
+	for(int i = 0; i < localCameraSize; i++)
+	{
+		double f, t[3], k1, k2, d[3];
+		Eigen::MatrixXd r(3,3);
+		Eigen::MatrixXd DR(3,3);
+		f = vCameraList[i].getFocalLength();
+		r = vCameraList[i].getRotation();
+		vCameraList[i].getTranslation(t);
+		vCameraList[i].getDistortionk1();//omitted by pba
+		vCameraList[i].getDistortionk2();//omitted by pba
+		f = f + cameraVectorX(i*cameraDimen + 0);
+		t[0] = t[0] + cameraVectorX(i*cameraDimen + 1);
+		t[1] = t[1] + cameraVectorX(i*cameraDimen + 2);
+		t[2] = t[2] + cameraVectorX(i*cameraDimen + 3);
+		d[0] = cameraVectorX(i*cameraDimen + 4);
+		d[1] = cameraVectorX(i*cameraDimen + 5);
+		d[2] = cameraVectorX(i*cameraDimen + 6);
+		UncompressRodriguesRotation(d, DR);
+		r = DR*r;
+		vCameraList[i].setFocalLength(f);
+		vCameraList[i].setTranslation(t);
+		vCameraList[i].setRotation(r);
+	}
+}
+
+void ParallelBundleAdjustmentSolver::dumpHessianMatrixEntry(std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList)
+{
+	std::ofstream of("../bitmap_matrix.dat");
+
+	//dump nonzero entries of the augmented hessian matrix
+	for(int i = 0; i < vObjectPointList.size(); i++)
+	{
+		int optColumn = i*structureDimen;
+		for(int j = 0; j < structureDimen; j++)
+		{
+			for(int k = 0; k < structureDimen; k++)
+			{
+				int row = optColumn + j;
+				int col = optColumn + k;
+				of<<row<<"  "<<col<<std::endl;
+			}
+		}
+	}
+
+	for(int i = 0; i < vProjectionList.size(); i++)
+	{
+		int optColumn = vProjectionList[i].getObjectPointIndex() * structureDimen;
+		int camColumn = numOfObjectPoint*structureDimen + vProjectionList[i].getCameraIndex() * cameraDimen;
+		for(int j = 0; j < structureDimen; j++)
+		{
+			for(int k = 0; k < cameraDimen; k++)
+			{
+				int row = optColumn + j;
+				int col = camColumn + k;
+				of<<row<<"  "<<col<<std::endl;
+				of<<col<<"  "<<row<<std::endl;
+			}
+		}
+	}
+
+	for(int i = 0; i < vCameraList.size(); i++)
+	{
+		int camColumn =  numOfObjectPoint*structureDimen + i*cameraDimen;
+		for(int j = 0; j < cameraDimen; j++)
+		{
+			for(int k = 0; k < cameraDimen; k++)
+			{
+				int row = camColumn + j;
+				int col = camColumn + k;
+				of<<row<<"  "<<col<<std::endl;
+			}
+		}
+	}
+
+	of.close();
+
+	std::ofstream out("../point_cloud.ply");
+	out<<"ply"<<std::endl;
+	out<<"format ascii 1.0"<<std::endl;
+	out<<"element vertex "<<numOfObjectPoint<<std::endl;
+	out<<"property double x"<<std::endl;
+	out<<"property double y"<<std::endl;
+	out<<"property double z"<<std::endl;
+	out<<"end_header"<<std::endl;
+	for(int i = 0; i < vObjectPointList.size(); i++)
+	{
+		out<<vObjectPointList[i].getPointX()<<std::endl;
+		out<<vObjectPointList[i].getPointY()<<std::endl;
+		out<<vObjectPointList[i].getPointZ()<<std::endl;
+	}
+	out.close();
+}
+
+
+void ParallelBundleAdjustmentSolver::dumpSubsetOfHessian(std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList)
+{
+    int nSample = 7*7*7;
+	std::ofstream of("../bitmap_matrix.dat");
+
+	//dump nonzero entries of the augmented hessian matrix
+    int nSubsetOfPointSize = vObjectPointList.size()/nSample;
+	for(int i = 0; i < nSubsetOfPointSize; i++)
+	{
+		int optColumn = i*structureDimen;
+		for(int j = 0; j < structureDimen; j++)
+		{
+			for(int k = 0; k < structureDimen; k++)
+			{
+				int row = optColumn + j;
+				int col = optColumn + k;
+				of<<row<<"  "<<col<<std::endl;
+			}
+		}
+	}
+
+	for(int i = 0; i < vProjectionList.size(); i++)
+	{
+		int optColumn = vProjectionList[i].getObjectPointIndex()/nSample * structureDimen;
+        if(vProjectionList[i].getObjectPointIndex() % nSample != 0)
+        {
+            continue;
+        }
+		int camColumn = nSubsetOfPointSize*structureDimen + vProjectionList[i].getCameraIndex() * cameraDimen;
+		for(int j = 0; j < structureDimen; j++)
+		{
+			for(int k = 0; k < cameraDimen; k++)
+			{
+				int row = optColumn + j;
+				int col = camColumn + k;
+				of<<row<<"  "<<col<<std::endl;
+				of<<col<<"  "<<row<<std::endl;
+			}
+		}
+	}
+
+	for(int i = 0; i < vCameraList.size(); i++)
+	{
+		int camColumn =  nSubsetOfPointSize*structureDimen + i*cameraDimen;
+		for(int j = 0; j < cameraDimen; j++)
+		{
+			for(int k = 0; k < cameraDimen; k++)
+			{
+				int row = camColumn + j;
+				int col = camColumn + k;
+				of<<row<<"  "<<col<<std::endl;
+			}
+		}
+	}
+
+	of.close();
+}
+
+
+void ParallelBundleAdjustmentSolver::parallelBundleAdjustment(std::vector<ObjectPoint>& vObjectPointList, std::vector<Projection>& vProjectionList, std::vector<Camera>& vCameraList)
+{
+	//dumpSubsetOfHessian(vObjectPointList, vProjectionList, vCameraList);
+
+	boost::mpi::timer sb;
+    double accu=0.0f;
+	for(int it = 0; it < 50; it++)
+	{
+		boost::mpi::timer timing;
+		boost::mpi::timer total;
+		//normalizeFocal(vCameraList);
+		//std::cout<<"                 Time Record                "<<std::endl;
+		//std::cout<< "Fill Matrix        Schur Complement          Cholesky Decomposition         Forward/Backward Substitution"<<std::endl;
+		fillSparseMatrix(vObjectPointList, vProjectionList, vCameraList);
+		if(lm_previous_error > 0.0f)//start from the second iteration
+		{
+			//std::cout<<lm_previous_error<<"   "<<lm_current_error<<std::endl;
+			double gain_ratio = (lm_previous_error - lm_current_error)/lm_gain_ratio_division;
+				
+			double delta_mse = (lm_previous_error - lm_current_error)/numOfProjection;
+
+
+			if(delta_mse > 0.20f)
+			{
+				double temp = 1 - (2*gain_ratio-1) * (2*gain_ratio-1) * (2*gain_ratio-1);
+				double maxim = temp>1.0f/3.0f?temp:1.0f/3.0f;
+				lm_damping_ratio = lm_damping_ratio * maxim;
+				lm_damping_scaling = 2.0f;
+			}
+			else if(delta_mse < 0)
+			{
+				lm_damping_ratio = lm_damping_ratio * lm_damping_scaling;
+				lm_damping_scaling = 2 * lm_damping_scaling;
+			}
+			else
+			{
+				lm_damping_ratio *= 0.20f;
+			}
+				
+			lm_damping_ratio = lm_damping_ratio < lm_min_damping ? lm_min_damping : lm_damping_ratio;
+			lm_damping_ratio = lm_damping_ratio > lm_max_damping ? lm_max_damping : lm_damping_ratio;
+
+		}
+		GetAugmentedHessian();
+		double t0 = timing.elapsed();
+
+		//step 1: Parallel Schur Complement
+		timing.restart();
+		Eigen::MatrixXd RCM = Eigen::MatrixXd::Zero(cameraMatrixSize, cameraMatrixSize);
+		Eigen::VectorXd RCV = Eigen::VectorXd::Zero(cameraMatrixSize);
+		parallelSchurComplement(RCM, RCV);
+		double t1 = timing.elapsed();
+
+		//step 2: Parallel Cholesky Decomposition
+		timing.restart();
+		parallelCholeskyDecomposition(RCM, RCV);
+		double t2 = timing.elapsed();
+
+		//step 3: Parallel Forward/Backward Substitution
+		timing.restart();
+		parallelForwardBackwardSubstitution(RCM, RCV);
+		double t3 = timing.elapsed();
+		//std::cout<<"Camera Parameters:"<<cameraVectorX<<std::endl;
+		//objectPointVectorX = matInv.selfadjointView<Eigen::Upper>() * (objectPointVector - observationMatrix*cameraVectorX);
+
+		Eigen::VectorXd vectorSub = Eigen::VectorXd::Zero(localObjectPointSize*structureDimen);
+		for(int i = 0; i < localObjectPointSize; i++)
+		{
+			for(int j = osvRowIdx[i]; j < osvRowIdx[i+1]; j++)
+			{
+				int col = osvColIdx[j];
+				vectorSub.segment(i*structureDimen, structureDimen) += observationMatrix[j] * cameraVectorX.segment(col*cameraDimen, cameraDimen);
+			}
+		}
+		vectorSub = objectPointVector - vectorSub;
+		objectPointVectorX.resize(localObjectPointSize*structureDimen);
+		for(int i = 0; i < localObjectPointSize; i++)
+		{
+			objectPointVectorX.segment(i*structureDimen, structureDimen) = structureMatrix[i] * vectorSub.segment(i*structureDimen, structureDimen);
+		}
+		//std::cout<<objectPointVectorX<<std::endl;
+        lm_gain_ratio_division = objectPointVectorX.dot(objectPointVectorX) + cameraVectorX.dot(cameraVectorX);
+        lm_gain_ratio_division = lm_gain_ratio_division/numOfProjection;
+
+
+		updateParameters(vObjectPointList, vProjectionList, vCameraList);
+		std::cout<<"Epoch "<<it<<": "<<t0<<"  "<<t1<<"  "<<t2<<"  "<<t3<<std::endl;
+
+		double t = total.elapsed();
+        accu+=t;
+		std::ofstream out;
+		out.open("./convergence.cms", std::ios::app);
+		out<<it<<"   "<<accu<<"   "<<MSE<<std::endl;
+		out.close();
+
+		if(MSE < lm_mse_threshold)
+		{
+			break;
+		}
+
+
+
+	}
+	double ttt = sb.elapsed();
+	std::cout<<"*******"<<ttt<<"*******"<<std::endl;
+}
